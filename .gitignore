@@ -1,0 +1,64 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+develop-eggs/
+sdist/
+wheels/
+pip-wheel-metadata/
+*.whl
+
+# ===== 虚拟环境 =====
+venv/
+.venv/
+env/
+ENV/
+.python-version
+
+# ===== PyInstaller =====
+build/
+dist/
+*.spec.bak
+# 单文件 exe 产物不入库（可通过 build.spec 重新打包）
+# build.spec 本身入库
+
+# ===== 运行时生成 =====
+settings.json
+_暂存区/
+暂存区/
+*.log
+exe_stdout.log
+exe_stderr.log
+
+# ===== 测试 / 临时 =====
+test_src/
+test_out*/
+test_geo*/
+
+# ===== IDE / 编辑器 =====
+.trae/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== 系统 =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== 数据库 / 缓存 =====
+*.db
+*.sqlite
+.cache/
+
+# ===== 临时工具（gh CLI 便携版下载） =====
+gh.zip
+gh_portable/

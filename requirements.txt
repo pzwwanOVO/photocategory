@@ -1,0 +1,8 @@
+Flask>=3.0
+Flask-SocketIO>=5.3
+pywin32>=306
+Pillow>=10.0
+exifread>=3.0
+fast-geocn>=1.1
+pywebview>=5.0
+pyinstaller>=6.0
