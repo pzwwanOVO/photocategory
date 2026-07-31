@@ -2,7 +2,7 @@
 """PyInstaller 打包配置：单 exe，含模板/静态资源/离线地理编码数据。
 
 构建：pyinstaller build.spec
-输出：dist/小米图片分类整理.exe
+输出：dist/NestPics.exe
 """
 from PyInstaller.utils.hooks import collect_all, collect_data_files
 
@@ -39,7 +39,11 @@ a = Analysis(
     hookspath=[],
     runtime_hooks=[],
     excludes=['tkinter', 'matplotlib', 'pandas',
-              'pytest', 'IPython', 'jupyter'],
+              'pytest', 'IPython', 'jupyter', 'notebook',
+              'PyQt5', 'PyQt6', 'PySide2', 'PySide6',
+              'scipy', 'sympy', 'zmq', 'tornado',
+              'numpy.testing', 'numpy.distutils', 'numpy.f2py',
+              'unittest', 'pydoc_data'],
     noarchive=False,
 )
 
@@ -51,7 +55,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='小米图片分类整理',
+    name='NestPics',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

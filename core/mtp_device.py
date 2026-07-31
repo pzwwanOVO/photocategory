@@ -1,6 +1,6 @@
 """USB/MTP 设备交互模块。
 
-通过 Windows Shell.Application COM（pywin32）访问 MTP 便携设备（小米手机），
+通过 Windows Shell.Application COM（pywin32）访问 MTP 便携设备（手机），
 提供设备枚举、存储探测、图片递归扫描与安全复制能力。
 
 同时提供 LocalSource，用本地目录模拟设备，便于无手机时联调测试。
@@ -46,16 +46,21 @@ def _com_uninit():
 
 
 def _is_drive_letter_path(path):
-    """判断是否为盘符路径，如 'C:\\'。"""
-    if not path or len(path) < 2:
+    """判断是否为盘符路径，如 'C:\\'。
+
+    注意：MTP 设备的路径是 CLSID 形式（以 '::' 开头），
+    不能仅凭 path[1]==':' 判定，否则会把设备误判为盘符而过滤掉。
+    """
+    if not path or len(path) < 3:
         return False
-    return path[1] == ":"
+    return path[0].isalpha() and path[1] == ":" and path[2] in ("\\", "/")
 
 
 def list_portable_devices():
     """枚举「此电脑」下的便携设备（无盘符的文件夹项）。
 
     返回 [{name, type}]。MTP 设备（手机）的 Path 为空、IsFolder 为 True。
+    过滤掉盘符驱动器和系统虚拟文件夹（如此电脑里的快捷方式）。
     """
     _com_init()
     try:
@@ -70,7 +75,11 @@ def list_portable_devices():
                 path = item.Path or ""
                 if _is_drive_letter_path(path):
                     continue  # 跳过普通盘符驱动器
-                devices.append({"name": str(item.Name), "type": str(item.Type)})
+                itype = str(item.Type)
+                # 过滤系统虚拟文件夹（如此电脑里的迅雷下载等快捷方式），只保留便携设备
+                low = itype.lower()
+                if "便携" in itype or "portable" in low:
+                    devices.append({"name": str(item.Name), "type": itype})
             except Exception:
                 continue
         return devices
@@ -99,7 +108,10 @@ def probe_device(device_name):
         if target is None:
             return {"authorized": False, "storages": [], "error": "设备未找到"}
         try:
-            device_folder = target.GetFolder()
+            # MTP 设备的 FolderItem.GetFolder() 返回字符串，须用 NameSpace(item)
+            device_folder = shell.NameSpace(target)
+            if device_folder is None:
+                return {"authorized": False, "storages": [], "error": "无法打开设备"}
         except Exception as e:
             return {"authorized": False, "storages": [], "error": str(e)}
         storages = []
@@ -200,6 +212,17 @@ class MtpDevice:
         self._storage_folder = None
         self._folder_cache = {}
 
+    def _to_folder(self, item):
+        """FolderItem → Folder（MTP 兼容）。
+
+        MTP 设备的 FolderItem.GetFolder() 返回字符串而非 Folder，
+        须用 shell.NameSpace(item) 代替。
+        """
+        folder = self._shell.NameSpace(item)
+        if folder is None:
+            raise MtpError(f"无法打开文件夹：{getattr(item, 'Name', '?')}")
+        return folder
+
     def connect(self):
         """打开设备并定位内部存储。返回存储名。"""
         _com_init()
@@ -216,7 +239,7 @@ class MtpDevice:
                 continue
         if target is None:
             raise MtpError(f"未找到设备：{self.device_name}")
-        self._device_folder = target.GetFolder()
+        self._device_folder = self._to_folder(target)
         storages = self.list_storages()
         if not storages:
             raise MtpError("设备无可访问存储，请在手机端授权 USB 文件传输")
@@ -229,7 +252,7 @@ class MtpDevice:
         sub = _get_subitem(self._device_folder, self._storage_name)
         if sub is None or not sub.IsFolder:
             raise MtpError(f"无法进入存储：{self._storage_name}")
-        self._storage_folder = sub.GetFolder()
+        self._storage_folder = self._to_folder(sub)
         return self._storage_name
 
     def list_storages(self):
@@ -254,7 +277,7 @@ class MtpDevice:
             sub = _get_subitem(folder, p)
             if sub is None or not sub.IsFolder:
                 raise MtpError(f"无法进入文件夹：{p}")
-            folder = sub.GetFolder()
+            folder = self._to_folder(sub)
         self._folder_cache[key] = folder
         return folder
 
@@ -268,6 +291,19 @@ class MtpDevice:
         if item is None:
             raise MtpError(f"设备上未找到文件：{'/'.join(rel_parts)}")
         return item
+
+    def has_folder(self, rel_parts):
+        """判断相对存储根的文件夹路径是否存在（用于品牌目录识别）。
+
+        rel_parts 为空时视为存储根本身，已连接即返回 True。
+        """
+        if not rel_parts:
+            return self._storage_folder is not None
+        try:
+            self._get_folder(rel_parts)
+            return True
+        except Exception:
+            return False
 
     def walk_images(self, scan_dirs=None):
         """递归扫描图片/视频文件。
@@ -284,8 +320,61 @@ class MtpDevice:
             top_item = _get_subitem(self._storage_folder, top)
             if top_item is None or not top_item.IsFolder:
                 continue
-            self._walk(top_item.GetFolder(), [top], results)
+            self._walk(self._to_folder(top_item), [top], results)
         return results
+
+    def walk_images_from(self, rel_parts):
+        """从指定子目录开始递归扫描图片/视频。
+
+        rel_parts 为相对存储根的路径段（如 ['DCIM', 'Camera']），
+        为空时退回到扫描全部 SCAN_DIRS。
+        """
+        if not rel_parts:
+            return self.walk_images()
+        if self._storage_folder is None:
+            raise MtpError("设备未连接")
+        top_item = _get_subitem(self._storage_folder, rel_parts[0])
+        if top_item is None or not top_item.IsFolder:
+            raise MtpError(f"设备上未找到目录：{rel_parts[0]}")
+        # 逐级下钻到目标目录
+        folder = self._to_folder(top_item)
+        for seg in rel_parts[1:]:
+            sub = _get_subitem(folder, seg)
+            if sub is None or not sub.IsFolder:
+                raise MtpError(f"设备上未找到目录：{seg}")
+            folder = self._to_folder(sub)
+        results = []
+        self._walk(folder, list(rel_parts), results)
+        return results
+
+    def list_folders(self, rel_parts=None):
+        """列出指定路径下的子文件夹（供前端浏览设备目录）。
+
+        rel_parts 为 None 或空时列出存储根下的文件夹。
+        返回 [{name, path}]，path 为以 '/' 连接的相对路径。
+        """
+        if self._storage_folder is None:
+            raise MtpError("设备未连接")
+        if not rel_parts:
+            folder = self._storage_folder
+        else:
+            folder = self._get_folder(rel_parts)
+        items = []
+        try:
+            for it in folder.Items():
+                try:
+                    if it.IsFolder:
+                        name = str(it.Name)
+                        items.append({
+                            "name": name,
+                            "path": "/".join((rel_parts or []) + [name]),
+                        })
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        items.sort(key=lambda x: x["name"].lower())
+        return items
 
     def _walk(self, folder, prefix, results):
         try:
@@ -302,7 +391,7 @@ class MtpDevice:
                 if name.lower() in config.SKIP_DIRS or name.startswith("."):
                     continue
                 try:
-                    self._walk(it.GetFolder(), prefix + [name], results)
+                    self._walk(self._to_folder(it), prefix + [name], results)
                 except Exception:
                     continue
             else:

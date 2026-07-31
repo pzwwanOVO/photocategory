@@ -8,6 +8,7 @@
 通过回调推送进度，与传输层（SocketIO）解耦。
 """
 import os
+import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -16,11 +17,12 @@ from core import exif_reader, geocoder, classifier, file_ops
 
 
 class Pipeline:
-    def __init__(self, source, target_root, callbacks=None, operation=None, workers=None):
+    def __init__(self, source, target_root, callbacks=None, operation=None, workers=None, backup_only=False):
         self.source = source
         self.target_root = os.path.abspath(target_root)
         self.cb = callbacks or {}
         self.operation = operation or config.DEFAULT_OPERATION
+        self.backup_only = bool(backup_only)
         # 本地模式才允许多线程；MTP 因 COM 线程绑定强制单线程
         if source.is_local:
             self.workers = max(1, int(workers or config.DEFAULT_WORKERS))
@@ -162,11 +164,45 @@ class Pipeline:
     def _process_one(self, entry):
         name = entry.get("name", "?")
         try:
+            if self.backup_only:
+                return self._process_backup(entry, name)
             if self.source.is_local:
                 return self._process_local(entry, name)
             return self._process_mtp(entry, name)
         except Exception as e:
             return {"ok": False, "error": str(e), "staging": None}
+
+    def _process_backup(self, entry, name):
+        """备份模式：仅复制到目标目录，保留设备原始目录结构，不做分类。
+
+        MTP：先复制到暂存 → 校验 → 移动到 <target>/<相对目录>/<原名>。
+        本地：直接复制到 <target>/<相对目录>/<原名>。
+        粗判类型仅用于进度展示，不影响文件归位。
+        """
+        ext = os.path.splitext(name)[1].lower()
+        rough = classifier.detect_type(entry["rel"], name, {}, ext)
+        if self.source.is_local:
+            src = entry.get("abs") or os.path.join(self.source.local_root, *entry["rel"])
+            if not os.path.exists(src):
+                return {"ok": False, "error": "源文件不存在", "staging": None}
+            rel_parts = entry["rel"][:-1]
+            dest_dir = os.path.join(self.target_root, *rel_parts) if rel_parts else self.target_root
+            file_ops.ensure_dir(dest_dir)
+            final_path = file_ops.resolve_collision(os.path.join(dest_dir, name))
+            shutil.copy2(src, final_path)
+            return {"ok": True, "type": rough, "final": final_path, "new_name": name}
+
+        # MTP 备份
+        staging_path, expected_size = self.source.copy_file(entry, self.staging_dir)
+        ok, msg = file_ops.verify_integrity(staging_path, expected_size)
+        if not ok:
+            return {"ok": False, "error": f"校验失败：{msg}", "staging": staging_path}
+        rel_parts = entry["rel"][:-1]
+        dest_dir = os.path.join(self.target_root, *rel_parts) if rel_parts else self.target_root
+        file_ops.ensure_dir(dest_dir)
+        final_path = file_ops.resolve_collision(os.path.join(dest_dir, name))
+        shutil.move(staging_path, final_path)
+        return {"ok": True, "type": rough, "final": final_path, "new_name": name}
 
     def _process_local(self, entry, name):
         src = entry.get("abs") or os.path.join(self.source.local_root, *entry["rel"])

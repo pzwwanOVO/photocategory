@@ -1,13 +1,13 @@
-"""小米图片分类管理程序 — Flask 后端入口。
+"""NestPics — Flask 后端入口。
 
 提供设备检测、存储探测、扫描、目录浏览、启动/停止流水线等 HTTP API，
 并通过 SocketIO 实时推送进度与统计。
 
 支持两种工作模式：
-- 传输备份：从 MTP 设备（小米手机）复制图片并分类
+- 传输备份：从 MTP 设备（手机）复制图片并分类
 - 图片分类：对本地已备份目录（如 D:\\photo）直接分类整理（copy/move）
 
-打包为单 exe 后，模板/静态资源从 _MEIPASS 加载，设置文件放在 exe 同级。
+打包为单 exe 后，模板/静态资源从 _MEIPASS 加载，设置文件放在用户 AppData。
 """
 import os
 import sys
@@ -20,7 +20,7 @@ from flask import Flask, request, jsonify, render_template
 from flask_socketio import SocketIO
 
 import config
-from core import mtp_device, classifier
+from core import mtp_device, classifier, phone_dirs
 from core.pipeline import Pipeline
 
 # 资源目录：打包后从 _MEIPASS 加载，开发时从项目目录加载
@@ -38,12 +38,72 @@ _state = {
     "target_dir": None,
     "operation": config.DEFAULT_OPERATION,  # copy / move
     "workers": config.DEFAULT_WORKERS,      # 并发线程数（本地分类）
+    "lang": config.DEFAULT_LANG,            # zh / en
+    "theme": config.DEFAULT_THEME,          # light / dark / system
+    "onboarded": False,                     # 是否完成首次引导
     "running": False,
     "pipeline": None,
     "last_stats": None,
     "last_progress": None,
 }
 _lock = threading.Lock()
+
+
+# ---------------- 后端文案 i18n ----------------
+MSG = {
+    "zh": {
+        "enum_dev_fail": "枚举设备失败：{e}",
+        "probe_dev_fail": "探测设备失败：{e}",
+        "local_invalid": "本地目录无效",
+        "missing_device": "缺少设备名",
+        "scan_fail": "扫描失败：{e}",
+        "path_missing": "路径不存在",
+        "read_dir_fail": "读取目录失败：{e}",
+        "target_invalid": "目标目录无效",
+        "already_running": "已有任务在运行",
+        "scan_first": "请先扫描图片",
+        "target_first": "请先选择目标目录",
+        "pipeline_error": "流水线异常：{e}",
+        "stop_sent": "已请求停止",
+        "no_running": "无运行中的任务",
+        "manual_input_hint": "或手动输入完整路径",
+        "browse_fail": "浏览设备目录失败：{e}",
+        "no_source_folder": "请先在设备上选择图片所在目录",
+    },
+    "en": {
+        "enum_dev_fail": "Failed to list devices: {e}",
+        "probe_dev_fail": "Failed to probe device: {e}",
+        "local_invalid": "Invalid local directory",
+        "missing_device": "Device name missing",
+        "scan_fail": "Scan failed: {e}",
+        "path_missing": "Path does not exist",
+        "read_dir_fail": "Failed to read directory: {e}",
+        "target_invalid": "Invalid target directory",
+        "already_running": "A task is already running",
+        "scan_first": "Please scan images first",
+        "target_first": "Please choose a target directory first",
+        "pipeline_error": "Pipeline error: {e}",
+        "stop_sent": "Stop requested",
+        "no_running": "No running task",
+        "manual_input_hint": "Or enter full path manually",
+        "browse_fail": "Failed to browse device: {e}",
+        "no_source_folder": "Please select the image folder on your device first",
+    },
+}
+
+
+def _lang():
+    with _lock:
+        return _state.get("lang") or config.DEFAULT_LANG
+
+
+def _t(key, **kw):
+    lang = _lang()
+    tpl = MSG.get(lang, MSG["zh"]).get(key, key)
+    try:
+        return tpl.format(**kw) if kw else tpl
+    except Exception:
+        return tpl
 
 
 # ---------------- 设置持久化 ----------------
@@ -76,6 +136,12 @@ if _initial.get("operation") in ("copy", "move"):
     _state["operation"] = _initial["operation"]
 if isinstance(_initial.get("workers"), int) and _initial["workers"] in config.WORKERS_OPTIONS:
     _state["workers"] = _initial["workers"]
+if _initial.get("lang") in config.LANG_OPTIONS:
+    _state["lang"] = _initial["lang"]
+if _initial.get("theme") in config.THEME_OPTIONS:
+    _state["theme"] = _initial["theme"]
+if isinstance(_initial.get("onboarded"), bool):
+    _state["onboarded"] = _initial["onboarded"]
 
 
 def _json_error(msg, code=400):
@@ -98,7 +164,16 @@ def api_settings_get():
             "operation": _state["operation"],
             "workers": _state["workers"],
             "workers_options": config.WORKERS_OPTIONS,
+            "lang": _state["lang"],
+            "lang_options": config.LANG_OPTIONS,
+            "theme": _state["theme"],
+            "theme_options": config.THEME_OPTIONS,
+            "onboarded": _state["onboarded"],
             "geo_available": _geocoder_available(),
+            "app_name": config.APP_NAME,
+            "version": config.VERSION,
+            "author": config.AUTHOR,
+            "github_url": config.GITHUB_URL,
         })
 
 
@@ -121,6 +196,15 @@ def api_settings_set():
         if isinstance(data.get("workers"), int) and data["workers"] in config.WORKERS_OPTIONS:
             _state["workers"] = data["workers"]
             changed["workers"] = _state["workers"]
+        if data.get("lang") in config.LANG_OPTIONS:
+            _state["lang"] = data["lang"]
+            changed["lang"] = _state["lang"]
+        if data.get("theme") in config.THEME_OPTIONS:
+            _state["theme"] = data["theme"]
+            changed["theme"] = _state["theme"]
+        if isinstance(data.get("onboarded"), bool):
+            _state["onboarded"] = data["onboarded"]
+            changed["onboarded"] = _state["onboarded"]
     if changed:
         save_settings(changed)
     return jsonify({"ok": True, **changed})
@@ -132,7 +216,7 @@ def api_devices():
     try:
         devs = mtp_device.list_portable_devices()
     except Exception as e:
-        return _json_error(f"枚举设备失败：{e}", 500)
+        return _json_error(_t("enum_dev_fail", e=e), 500)
     return jsonify({"ok": True, "devices": devs})
 
 
@@ -141,8 +225,64 @@ def api_storages(name):
     try:
         info = mtp_device.probe_device(name)
     except Exception as e:
-        return _json_error(f"探测设备失败：{e}", 500)
+        return _json_error(_t("probe_dev_fail", e=e), 500)
     return jsonify({"ok": True, **info})
+
+
+# ---------------- 设备目录浏览（MTP） ----------------
+@app.route("/api/mtp/browse")
+def api_mtp_browse():
+    """浏览 MTP 设备的目录树，供前端选择正确的图片源目录。"""
+    device = request.args.get("device", "").strip()
+    path = request.args.get("path", "").strip()
+    if not device:
+        return _json_error(_t("missing_device"))
+    try:
+        dev = mtp_device.MtpDevice(device)
+        storage = dev.connect()
+        rel = [p for p in path.split("/") if p] if path else []
+        folders = dev.list_folders(rel)
+        dev.close()
+    except Exception as e:
+        return _json_error(_t("scan_fail", e=e))
+    return jsonify({
+        "ok": True,
+        "device": device,
+        "storage": storage,
+        "current": path,
+        "items": folders,
+    })
+
+
+# ---------------- 设备图片目录识别（按机型） ----------------
+@app.route("/api/mtp/suggest_dirs")
+def api_mtp_suggest_dirs():
+    """按机型识别图片存放目录：返回品牌 + 设备上实际存在的候选目录。"""
+    device = request.args.get("device", "").strip()
+    if not device:
+        return _json_error(_t("missing_device"))
+    try:
+        dev = mtp_device.MtpDevice(device)
+        storage = dev.connect()
+        brand = phone_dirs.detect_brand(device)
+        candidates = phone_dirs.candidate_dirs(device)
+        existing = []
+        for c in candidates:
+            rel = [p for p in c.split("/") if p]
+            if dev.has_folder(rel):
+                existing.append(c)
+        dev.close()
+    except Exception as e:
+        return _json_error(_t("scan_fail", e=e))
+    return jsonify({
+        "ok": True,
+        "device": device,
+        "storage": storage,
+        "brand": brand,
+        "brand_label": phone_dirs.brand_label(brand),
+        "dirs": existing,
+        "candidates": candidates,
+    })
 
 
 # ---------------- 扫描 ----------------
@@ -154,7 +294,7 @@ def api_scan():
         if mode == "local":
             path = data.get("path")
             if not path or not os.path.isdir(path):
-                return _json_error("本地目录无效")
+                return _json_error(_t("local_invalid"))
             source = mtp_device.LocalSource(path)
             source.connect()
             entries = source.walk_images()
@@ -163,14 +303,35 @@ def api_scan():
         else:
             name = data.get("name")
             if not name:
-                return _json_error("缺少设备名")
+                return _json_error(_t("missing_device"))
+            scan_paths = data.get("scan_paths")
+            scan_path = data.get("scan_path", "")
             source = mtp_device.MtpDevice(name)
             storage = source.connect()
-            entries = source.walk_images()
-            source_config = {"type": "mtp", "name": name, "storage": storage}
+            # 支持多目录扫描：scan_paths（数组）优先，回退单个 scan_path
+            if isinstance(scan_paths, list) and scan_paths:
+                path_list = [p for p in scan_paths if isinstance(p, str) and p.strip()]
+            elif scan_path:
+                path_list = [scan_path]
+            else:
+                path_list = []
+            seen = set()
+            entries = []
+            for sp in path_list:
+                rel = [p for p in sp.split("/") if p] if sp else []
+                part = source.walk_images_from(rel) if rel else source.walk_images()
+                for e in part:
+                    key = "/".join(e["rel"])
+                    if key not in seen:
+                        seen.add(key)
+                        entries.append(e)
+            source_config = {
+                "type": "mtp", "name": name, "storage": storage,
+                "scan_paths": path_list,
+            }
             source.close()
     except Exception as e:
-        return _json_error(f"扫描失败：{e}")
+        return _json_error(_t("scan_fail", e=e))
 
     # 预览：粗判类型 + 取前若干条
     preview = []
@@ -211,7 +372,7 @@ def api_browse():
                 drives.append({"name": f"{letter}:", "path": d})
         return jsonify({"ok": True, "current": "", "items": drives})
     if not os.path.isdir(path):
-        return _json_error("路径不存在")
+        return _json_error(_t("path_missing"))
     items = []
     try:
         for entry in os.listdir(path):
@@ -219,7 +380,7 @@ def api_browse():
             if os.path.isdir(full):
                 items.append({"name": entry, "path": full})
     except Exception as e:
-        return _json_error(f"读取目录失败：{e}")
+        return _json_error(_t("read_dir_fail", e=e))
     items.sort(key=lambda x: x["name"].lower())
     return jsonify({"ok": True, "current": path, "items": items})
 
@@ -229,7 +390,7 @@ def api_target():
     data = request.get_json(force=True) or {}
     path = data.get("path")
     if not path or not os.path.isdir(path):
-        return _json_error("目标目录无效")
+        return _json_error(_t("target_invalid"))
     with _lock:
         _state["target_dir"] = os.path.abspath(path)
     save_settings({"target_dir": _state["target_dir"]})
@@ -243,13 +404,14 @@ def api_start():
     operation = data.get("operation") or _state["operation"]
     if operation not in ("copy", "move"):
         operation = config.DEFAULT_OPERATION
+    backup_only = bool(data.get("backup_only", False))
     with _lock:
         if _state["running"]:
-            return _json_error("已有任务在运行")
+            return _json_error(_t("already_running"))
         if not _state["entries"]:
-            return _json_error("请先扫描图片")
+            return _json_error(_t("scan_first"))
         if not _state["target_dir"]:
-            return _json_error("请先选择目标目录")
+            return _json_error(_t("target_first"))
         source_config = _state["source_config"]
         entries = _state["entries"]
         target_dir = _state["target_dir"]
@@ -263,10 +425,15 @@ def api_start():
     workers = _state["workers"]
 
     thread = threading.Thread(
-        target=_run_pipeline, args=(source_config, entries, target_dir, operation, workers), daemon=True
+        target=_run_pipeline,
+        args=(source_config, entries, target_dir, operation, workers, backup_only),
+        daemon=True,
     )
     thread.start()
-    return jsonify({"ok": True, "count": len(entries), "target": target_dir, "operation": operation, "workers": workers})
+    return jsonify({
+        "ok": True, "count": len(entries), "target": target_dir,
+        "operation": operation, "workers": workers, "backup_only": backup_only,
+    })
 
 
 def _make_source(source_config):
@@ -278,7 +445,7 @@ def _make_source(source_config):
     return s
 
 
-def _run_pipeline(source_config, entries, target_dir, operation, workers):
+def _run_pipeline(source_config, entries, target_dir, operation, workers, backup_only=False):
     source = None
     pipeline = None
     try:
@@ -289,14 +456,14 @@ def _run_pipeline(source_config, entries, target_dir, operation, workers):
             "log": lambda p: socketio.emit("log", p),
         }
         pipeline = Pipeline(source, target_root=target_dir, callbacks=callbacks,
-                            operation=operation, workers=workers)
+                            operation=operation, workers=workers, backup_only=backup_only)
         with _lock:
             _state["pipeline"] = pipeline
         stats = pipeline.run(entries)
         with _lock:
             _state["last_stats"] = stats
     except Exception as e:
-        socketio.emit("error", {"message": f"流水线异常：{e}"})
+        socketio.emit("error", {"message": _t("pipeline_error", e=e)})
     finally:
         if source:
             try:
@@ -320,8 +487,8 @@ def api_stop():
         pipeline = _state["pipeline"]
     if pipeline:
         pipeline.stop()
-        return jsonify({"ok": True, "msg": "已请求停止"})
-    return _json_error("无运行中的任务")
+        return jsonify({"ok": True, "msg": _t("stop_sent")})
+    return _json_error(_t("no_running"))
 
 
 @app.route("/api/status")
@@ -336,6 +503,11 @@ def api_status():
             "workers": _state["workers"],
             "source": _state["source_config"],
             "geo_available": _geocoder_available(),
+            "lang": _state["lang"],
+            "theme": _state["theme"],
+            "onboarded": _state["onboarded"],
+            "app_name": config.APP_NAME,
+            "version": config.VERSION,
         })
 
 
@@ -413,6 +585,51 @@ class WindowApi:
         if self._window:
             self._window.destroy()
 
+    def open_url(self, url):
+        """用系统默认浏览器打开外部链接（如 GitHub）。"""
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+
+
+def _ensure_single_instance():
+    """单实例控制：用命名互斥锁保证同时只有一个窗口。
+
+    若已有实例运行，则尝试把已有窗口提到前台后退出当前进程。
+    返回 True 表示当前进程应继续，False 表示应退出。
+    """
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        mutex_name = "PhotoCategory_SingleInstance_Mutex"
+        kernel32 = ctypes.windll.kernel32
+        ERROR_ALREADY_EXISTS = 183
+
+        # CreateMutexW(默认安全属性, 初始不占有, 名称)
+        handle = kernel32.CreateMutexW(None, False, mutex_name)
+        if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            # 已有实例：尝试按窗口标题找到并前置
+            user32 = ctypes.windll.user32
+            user32.FindWindowW.restype = wintypes.HWND
+            user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+            hwnd = user32.FindWindowW(None, config.APP_NAME)
+            if hwnd:
+                # 恢复 -> 前置
+                SW_RESTORE = 9
+                user32.ShowWindow(hwnd, SW_RESTORE)
+                user32.SetForegroundWindow(hwnd)
+            return False
+        # 保持 mutex 句柄存活，避免释放导致后续实例误判
+        _ensure_single_instance._handle = handle
+        return True
+    except Exception:
+        # 任何异常都不阻挡启动
+        return True
+
 
 def _open_native_window():
     """用 pywebview 打开无边框原生应用窗口（非浏览器）。
@@ -447,7 +664,7 @@ def _open_native_window():
 
     api = WindowApi()
     win = webview.create_window(
-        title="小米图片分类整理",
+        title=config.APP_NAME,
         url=f"http://{config.HOST}:{config.PORT}/",
         js_api=api,
         width=1180,
@@ -464,5 +681,8 @@ def _open_native_window():
 
 
 if __name__ == "__main__":
+    if not _ensure_single_instance():
+        # 已有实例运行，本进程退出
+        sys.exit(0)
     print(f"启动服务：http://{config.HOST}:{config.PORT}")
     _open_native_window()

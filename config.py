@@ -11,18 +11,29 @@ def _is_frozen():
 # 资源根目录：打包后指向 _MEIPASS，开发时指向项目目录
 if _is_frozen():
     BASE_DIR = sys._MEIPASS
-    # 运行时数据目录（设置、日志）放在 exe 同级
-    RUNTIME_DIR = os.path.dirname(sys.executable)
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    RUNTIME_DIR = BASE_DIR
+
+# 应用元信息
+APP_NAME = "NestPics"
+VERSION = "1.0.0"
+AUTHOR = "pzwwanOVO"
+GITHUB_URL = "https://github.com/pzwwanOVO/photocategory"
+
+# 运行时数据目录（设置文件）放在用户 AppData，避免 exe 同级出现 settings.json
+_appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
+APP_DATA_DIR = os.path.join(_appdata, "PhotoCategory")
+try:
+    os.makedirs(APP_DATA_DIR, exist_ok=True)
+except Exception:
+    APP_DATA_DIR = os.path.dirname(sys.executable) if _is_frozen() else BASE_DIR
 
 # 服务监听
 HOST = "127.0.0.1"
 PORT = 5000
 
-# 设置文件路径（持久化默认目标目录、操作方式等）
-SETTINGS_FILE = os.path.join(RUNTIME_DIR, "settings.json")
+# 设置文件路径（持久化默认目标目录、操作方式、语言、主题、引导完成标记等）
+SETTINGS_FILE = os.path.join(APP_DATA_DIR, "settings.json")
 
 # 设备轮询相关
 DEVICE_POLL_INTERVAL = 2  # 前端轮询间隔（秒）
@@ -78,6 +89,14 @@ DEFAULT_OPERATION = "copy"
 # 保守起见默认 1 线程；档位参考：1=最低占用 2=平衡 4=较快
 DEFAULT_WORKERS = 1
 WORKERS_OPTIONS = [1, 2, 4]
+
+# 界面语言：zh / en
+DEFAULT_LANG = "zh"
+LANG_OPTIONS = ["zh", "en"]
+
+# 主题：light / dark / system（system 跟随系统深浅色）
+DEFAULT_THEME = "system"
+THEME_OPTIONS = ["light", "dark", "system"]
 
 # 目录来源映射：路径段（小写）→ (类别, 来源名)
 # 类别: photo / screenshot / app / recording

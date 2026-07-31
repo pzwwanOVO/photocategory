@@ -1,6 +1,6 @@
 """Android 包名 → 应用中文名 映射表。
 
-小米截图文件名形如 Screenshot_2024-01-15-10-30-45-123_com.tencent.mm.jpg，
+截图文件名形如 Screenshot_2024-01-15-10-30-45-123_com.tencent.mm.jpg，
 末尾的 com.tencent.mm 即截图时所在应用的包名。
 """
 
